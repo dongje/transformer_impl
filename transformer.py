@@ -35,14 +35,15 @@ class MultiheadAttention(nn.Module):
         K = torch.cat(K , dim = 0)      # K | heads * bs , n , dk|
         V = torch.cat(V , dim = 0)      # V | heads * bs , n , dk|
 
-        QKmatmuled = torch.matmul(Q, torch.transpose(K, 1, 2)) / self.dk ** .5  # | heads * bs , m , n |
+        QKmatmuled = torch.matmul(Q, torch.transpose(K, 1, 2))   # | heads * bs , m , n |
         #주로 인코더에서 쓰이는 입력x에대한 패딩 마스크 (소프트맥스를 0으로 만들기 위한)
         #또는 decoder 학습모드에서 다음 timestep을 보는걸 방지하기 위한
-        # if mask is not None:
-        #     assert QKmatmuled.size() == mask.size()
-        #     QKmatmuled.masked_fill_(mask,-float('inf'))
+        if mask is not None:   #mask = |batch_size , m , n|
+            mask = torch.cat([mask for _ in range(self.heads)] , dim = 0)    #mask = | batch_size * heads , m , n |
+            assert QKmatmuled.size() == mask.size()
+            QKmatmuled.masked_fill_(mask,-float('inf'))
 
-        somtmaxQK = self.softmax(QKmatmuled)   # | heads * bs , m , n |
+        somtmaxQK = self.softmax(QKmatmuled/(self.dk ** .5))   # | heads * bs , m , n |
         result_v = torch.bmm(somtmaxQK,V)        # | heads * bs , m , dk |
         result = torch.cat(result_v.split( Query_x.size(0) , dim = 0),dim = -1)  # | bs , m , dk * heads |
 
@@ -78,7 +79,7 @@ class EncoderBlock(nn.Module):
         #정규화 순서에따라 다른 순서로 계산
         if self.first_norm:
             final1 = self.layer_norm(x)
-            final1 = self.dropout(self.multihead_att(final1,final1,pad_mask))
+            final1 = x + self.dropout(self.multihead_att(final1,final1,pad_mask))
 
             final2 = self.FFN(self.layer_norm(final1))
             final2 = final1 + self.dropout(final2)
@@ -130,7 +131,7 @@ class DecoderBlock(nn.Module):
                 # x = |bs, n , hidden_size|
                 #final1 = |bs , n , hidden_size|
                 final1 = self.layer_norm(x)
-                final1 = final1 + \
+                final1 = x + \
                          self.dropout(self.multihead_att1(final1, final1, mask=future_mask))  # decoder에서 미래의 답 보는거 방지
             else:  ## search 모드  t번째.
                 # x = |bs , 1 , hidden_size|
@@ -138,14 +139,14 @@ class DecoderBlock(nn.Module):
                 # final1 = |bs , 1 , hidden_size|
                 normed_prev = self.layer_norm(prev)
                 final1 = self.layer_norm(x)
-                final1 = final1 +\
+                final1 = x +\
                           self.dropout(self.multihead_att1(final1, normed_prev, mask=None))
 
             final2 = self.layer_norm(final1)
-            final2 = final2 + self.dropout(self.multihead_att2(final2, encoder_x, pad_mask))
+            final2 = final1 + self.dropout(self.multihead_att2(final2, encoder_x, pad_mask))
 
             final3 = self.layer_norm(final2)
-            final3 = final3 + self.dropout(self.FFN(final3))
+            final3 = final2 + self.dropout(self.FFN(final3))
 
             return final3, encoder_x, pad_mask, future_mask, prev
 
@@ -229,7 +230,7 @@ class Transformer(nn.Module):
         pos_encoding[:,0::2] = torch.sin(pos / 10000**(i/self.hidden_size))
         pos_encoding[:,1::2] = torch.cos(pos / 10000**(i/self.hidden_size))
 
-        return pos_encoding.unsqueeze(0).expand(bs,self.max_length,self.hidden_size)   # |batch_size , length , hidden_size|
+        return pos_encoding.unsqueeze(0).expand(bs,self.max_length,self.hidden_size)   # |batch_size , full_length , hidden_size|
 
     def get_pos_encoding(self,bs,pos_enc,len,start_pos=0):
         assert len + start_pos <= self.max_length
@@ -239,8 +240,7 @@ class Transformer(nn.Module):
     # 인코더,디코더에서 멀티헤드어텐션시 input에대한 pad을 -inf로 채우기위한 마스크
     def generate_pad_mask(self,query_x , keyandvalue_y): # |bs , m|  ,  |bs , n|
         with torch.no_grad():
-            mask_key = keyandvalue_y.bool()  ##keyandvalue는 pad_token이 0이면 False로 나타남
-            mask_key = ~mask_key
+            mask_key = (keyandvalue_y == pad_token)  ##keyandvalue는 pad_token이면 true로 나타남
             mask_ = mask_key.unsqueeze(1).expand(*query_x.size(),keyandvalue_y.size(1))
             return mask_   ## size : |batch_size , m , n|
 

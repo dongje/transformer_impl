@@ -49,11 +49,20 @@ def define_arguparser():
     return config
 
 
-def get_crit(output_size, pad_index):
+def get_crit(output_size, pad_index,vocab):
+
+    itos = []
+    for k in vocab.itos:
+        itos.append(vocab.freqs[k])
+    itos = nn.Softmax(torch.tensor(itos),dim = 0)
+    itos[itos == 0] = float('inf')
+    itos = 1/itos
+
     # Default weight for loss equals to 1, but we don't need to get loss for PAD token.
     # Thus, set a weight for PAD to zero.
-    loss_weight = torch.ones(output_size)
-    loss_weight[pad_index] = 0.
+    loss_weight = torch.ones_like(output_size)
+    loss_weight[pad_index] = 0
+
     # Instead of using Cross-Entropy loss,
     # we can use Negative Log-Likelihood(NLL) loss with log-probability.
     crit = nn.NLLLoss(
@@ -122,7 +131,7 @@ def trainandvalidate(config,model,crit,optimizer,dataloader):
                     y_hat.contiguous().view(-1 , y_hat.size(-1)),
                     y.contiguous().view(-1)
                 )
-                backward_target = loss.div(y_hat.size(0)).div(config.iteration_per_update)
+                backward_target = loss.div(y_hat.size(0))
 
                 if config.device >= 0 and config.autocast:
                     scaler.scale(backward_target).backward()
@@ -131,12 +140,12 @@ def trainandvalidate(config,model,crit,optimizer,dataloader):
 
             if i % config.iteration_per_update == 0:
                 if config.device >= 0 and config.autocast:
-                # Use scaler instead of engine.optimizer.step() if using GPU.
+                # Use scaler instead of optimizer.step() if using GPU.
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     optimizer.step()
-                    1
+
             loss = loss / word_count(y)
             ppl = np.exp(loss.detach().cpu().numpy())
             print(f'train iter : {i} loss : {loss} ppl : {ppl}')
@@ -215,7 +224,8 @@ def main(config):
                                     dropout_p=config.dropout_p,
                                     max_length=config.max_length,
                                     first_norm=config.first_norm)
-    crit = get_crit(output_size, transformer.pad_token)
+#    crit = get_crit(output_size, transformer.pad_token)
+    crit = nn.NLLLoss(ignore_index=transformer.pad_token,reduction='sum')
     optimizer = get_optimizer(model,config)
 
     if config.device >= 0:
