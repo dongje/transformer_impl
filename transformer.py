@@ -220,7 +220,10 @@ class Transformer(nn.Module):
                 nn.LogSoftmax(dim = -1)
             )
 
+        self.pos_enc = self._generate_pos_enc(hidden_size, max_length)
+
     # x,y에대한 임베딩 벡터에 대해 순서에대한 정보를 나타내는 encoding 생성
+    @torch.no_grad()
     def generate_pos_encoding(self,bs):
         pos_encoding = torch.zeros(self.max_length,self.hidden_size,dtype=torch.float)   # |length , hidden_size|
 
@@ -237,7 +240,35 @@ class Transformer(nn.Module):
 
         return pos_enc[:,start_pos:len+start_pos,:]
 
+    @torch.no_grad()
+    def _generate_pos_enc(self, hidden_size, max_length):
+        enc = torch.FloatTensor(max_length, hidden_size).zero_()
+        # |enc| = (max_length, hidden_size)
+
+        pos = torch.arange(0, max_length).unsqueeze(-1).float()
+        dim = torch.arange(0, hidden_size // 2).unsqueeze(0).float()
+        # |pos| = (max_length, 1)
+        # |dim| = (1, hidden_size // 2)
+
+        enc[:, 0::2] = torch.sin(pos / 1e+4**dim.div(float(hidden_size)))   #이게 어떻게 가능함??
+        enc[:, 1::2] = torch.cos(pos / 1e+4**dim.div(float(hidden_size)))
+
+        return enc
+
+    def _position_encoding(self, x, init_pos=0):
+        # |x| = (batch_size, n, hidden_size)
+        # |self.pos_enc| = (max_length, hidden_size)
+        assert x.size(-1) == self.pos_enc.size(-1)
+        assert x.size(1) + init_pos <= self.max_length
+
+        pos_enc = self.pos_enc[init_pos:init_pos + x.size(1)].unsqueeze(0)   ## 이게 어떻게 가능함?
+        # |pos_enc| = (1, n, hidden_size)
+        x = x + pos_enc.to(x.device)
+
+        return x
+
     # 인코더,디코더에서 멀티헤드어텐션시 input에대한 pad을 -inf로 채우기위한 마스크
+    @torch.no_grad()
     def generate_pad_mask(self,query_x , keyandvalue_y): # |bs , m|  ,  |bs , n|
         with torch.no_grad():
             mask_key = (keyandvalue_y == pad_token)  ##keyandvalue는 pad_token이면 true로 나타남
@@ -245,6 +276,7 @@ class Transformer(nn.Module):
             return mask_   ## size : |batch_size , m , n|
 
     # 디코더에서 학습 시 n번째 timestep에서 n+1번째 timestep과 어텐션 하는걸 방지하는 마스크 생성
+    @torch.no_grad()
     def generate_decoder_future_mask(self,x,input_y): # |bs , n |
         with torch.no_grad():
             mask = torch.triu(x.new_ones((input_y.size(1),input_y.size(1))),diagonal=1).bool()
@@ -253,18 +285,19 @@ class Transformer(nn.Module):
 
     def forward(self,x,y): # x |batch_size , m |  y |batch_size , n |   type of indice
 
-        pos_enc = self.generate_pos_encoding(x.size(0))
+        with torch.no_grad():
+            pos_enc = self.generate_pos_encoding(x.size(0))
 
-        encoder_mask = self.generate_pad_mask(x,x)
-        decoder_mask = self.generate_pad_mask(y,x)
+            encoder_mask = self.generate_pad_mask(x,x)
+            decoder_mask = self.generate_pad_mask(y,x)
         x = self.encoder_emb(x)   # x = | batch_size , m , hidden_size|
         x = x + self.get_pos_encoding(x.size(0),pos_enc,x.size(1)).to(x.device)  # x = |bs , m , hidden_size|
-        encoder_result,_ = self.encoders(x,encoder_mask)   # encoder_result = |bs , m , hidden_size|
-
-        future_mask = self.generate_decoder_future_mask(x,y)
-        y = self.decoder_emb(y)   # |batch_size , n , Vy|
+        encoder_result,_ = self.encoders(self.dropout(x),encoder_mask)   # encoder_result = |bs , m , hidden_size|
+        with torch.no_grad():
+            future_mask = self.generate_decoder_future_mask(x,y)
+        y = self.decoder_emb(y)   # y = |batch_size , n , hidden_size|
         y = y + self.get_pos_encoding(y.size(0),pos_enc,y.size(1)).to(x.device)   # y = |bs , n , hidden_size|
-        decoder_result,_1,_2,_3,_4 = self.decoders( y , encoder_result,decoder_mask, future_mask,None)
+        decoder_result,_1,_2,_3,_4 = self.decoders( self.dropout(y) , encoder_result,decoder_mask, future_mask,None)
         y_hat = self.generator(decoder_result)
 
         return y_hat
@@ -325,6 +358,113 @@ class Transformer(nn.Module):
 
         return indices
 
+
+class encoder_classifier(nn.Module):
+
+    def __init__(self,
+                 input_size,output_size,
+                 layers=6,
+                 hidden_size=768,
+                 heads=8,
+                 dropout_p = 0.1,
+                 max_length = 256,
+                 first_norm = False,
+                 use_leaky_relu = False,
+                 ):
+
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.heads = heads
+        self.dk = hidden_size // heads
+        self.max_length = max_length
+
+        self.encoder_emb = nn.Embedding(input_size,hidden_size)
+        self.dropout = nn.Dropout(dropout_p)
+
+        encoder_layers = [EncoderBlock(hidden_size,heads,dropout_p=0.1,leaky_relu=use_leaky_relu)\
+                          for i in range(layers)]
+        self.encoders = coder_sequential(*encoder_layers)
+
+        if first_norm:
+            self.generator = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, output_size),
+                nn.LogSoftmax(dim=-1)
+            )
+        else:
+            self.generator = nn.Sequential(
+                nn.Linear(hidden_size, output_size),
+                nn.LogSoftmax(dim = -1)
+            )
+
+
+
+        self.pos_enc = self._generate_pos_enc(hidden_size, max_length)
+
+    # x,y에대한 임베딩 벡터에 대해 순서에대한 정보를 나타내는 encoding 생성
+    @torch.no_grad()
+    def generate_pos_encoding(self,bs):
+        pos_encoding = torch.zeros(self.max_length,self.hidden_size,dtype=torch.float)   # |length , hidden_size|
+
+        pos = torch.arange(self.max_length).unsqueeze(1).float()  ## |max_length , 1|
+        i = (torch.arange(self.hidden_size//2).unsqueeze(0).float()) * 2   ## |1 , hidden_size//2 |
+
+        pos_encoding[:,0::2] = torch.sin(pos / 10000**(i/self.hidden_size))
+        pos_encoding[:,1::2] = torch.cos(pos / 10000**(i/self.hidden_size))
+
+        return pos_encoding.unsqueeze(0).expand(bs,self.max_length,self.hidden_size)   # |batch_size , full_length , hidden_size|
+
+    def get_pos_encoding(self,bs,pos_enc,len,start_pos=0):
+        assert len + start_pos <= self.max_length
+
+        return pos_enc[:,start_pos:len+start_pos,:]
+
+    @torch.no_grad()
+    def _generate_pos_enc(self, hidden_size, max_length):
+        enc = torch.FloatTensor(max_length, hidden_size).zero_()
+        # |enc| = (max_length, hidden_size)
+
+        pos = torch.arange(0, max_length).unsqueeze(-1).float()
+        dim = torch.arange(0, hidden_size // 2).unsqueeze(0).float()
+        # |pos| = (max_length, 1)
+        # |dim| = (1, hidden_size // 2)
+
+        enc[:, 0::2] = torch.sin(pos / 1e+4**dim.div(float(hidden_size)))   #이게 어떻게 가능함??
+        enc[:, 1::2] = torch.cos(pos / 1e+4**dim.div(float(hidden_size)))
+
+        return enc
+
+    def _position_encoding(self, x, init_pos=0):
+        # |x| = (batch_size, n, hidden_size)
+        # |self.pos_enc| = (max_length, hidden_size)
+        assert x.size(-1) == self.pos_enc.size(-1)
+        assert x.size(1) + init_pos <= self.max_length
+
+        pos_enc = self.pos_enc[init_pos:init_pos + x.size(1)].unsqueeze(0)   ## 이게 어떻게 가능함?
+        # |pos_enc| = (1, n, hidden_size)
+        x = x + pos_enc.to(x.device)
+
+        return x
+
+    # 인코더,디코더에서 멀티헤드어텐션시 input에대한 pad을 -inf로 채우기위한 마스크
+    @torch.no_grad()
+    def generate_pad_mask(self,query_x , keyandvalue_y): # |bs , m|  ,  |bs , n|
+        with torch.no_grad():
+            mask_key = (keyandvalue_y == pad_token)  ##keyandvalue는 pad_token이면 true로 나타남
+            mask_ = mask_key.unsqueeze(1).expand(*query_x.size(),keyandvalue_y.size(1))
+            return mask_   ## size : |batch_size , m , n|
+
+    def forward(self,x):
+        with torch.no_grad():
+            pos_enc = self.generate_pos_encoding(x.size(0))
+            encoder_mask = self.generate_pad_mask(x, x)
+        x = self.encoder_emb(x)  # x = | batch_size , m , hidden_size|
+        x = x + self.get_pos_encoding(x.size(0), pos_enc, x.size(1)).to(x.device)  # x = |bs , m , hidden_size|
+        encoder_result, _ = self.encoders(self.dropout(x), encoder_mask)  # encoder_result = |bs , m , hidden_size|
+        y_hat = self.generator(encoder_result)   # y_hat = |bs , m , output_size|
+
+
+        return y_hat[:,0,:]    ##  y_hat = |bs , input_size|  bos token만 return
 
 
 

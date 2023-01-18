@@ -1,0 +1,79 @@
+
+from torchtext.data import TabularDataset
+from torch.utils.data import Dataset , DataLoader ,random_split
+from datasets import load_dataset
+import random
+import re
+import os
+import torchtext
+version = list(map(int, torchtext.__version__.split('.')))
+if version[0] <= 0 and version[1] < 9:
+    from torchtext import data
+else:
+    from torchtext.legacy import data
+from nltk.tokenize import word_tokenize
+
+import spacy
+from nltk import tokenize
+from torchtext.data.utils import get_tokenizer
+en_tokenizer = get_tokenizer('spacy', language='en_core_web_sm')
+
+
+
+class imdb_loader:
+
+    def __init__(self,ibdm_path ,train_split = 0.8,max_length = 255,
+                 batch_size = 16,
+                 device='cpu',
+                 min_vocab = 1,
+                 max_vocab = 9999999):
+
+        super().__init__()
+
+        self.src = data.Field(
+            sequential=True,
+            use_vocab=True,
+            batch_first=True,
+#            include_lengths=True,
+            lower=True,
+            init_token='<BOS>',
+#            eos_token='<EOS>',
+            tokenize=en_tokenizer
+        )
+        self.tgt = data.Field(
+            use_vocab=True,
+            batch_first=True
+#            include_lengths=True,
+        )
+
+        train_data , valid_data = TabularDataset(
+            path=ibdm_path,
+            format = 'csv',
+            fields=[('review',self.src),('sentiment',self.tgt)],
+
+        ).split(split_ratio = train_split)
+
+        dataset_size = len(train_data)
+
+
+        self.train_iter , self.valid_iter= data.BucketIterator.splits(
+            (train_data,valid_data),
+            batch_size=batch_size,
+            device='cuda:%d' % device if device >= 0 else 'cpu',
+            shuffle=True,
+            sort_key = lambda x: len(x.review),
+            sort_within_batch=True,
+        )
+
+
+        self.tgt.build_vocab(train_data)
+        self.src.build_vocab(train_data,max_size = max_vocab,min_freq = min_vocab)
+
+# imdb_loader = imdb_loader('dataset/imdb_dataset_shuf_train.csv',
+#                         batch_size=16,device=0)
+#
+#
+# for i , train_data in enumerate(imdb_loader.train_iter):
+#      print(train_data.review)
+#      pass
+#
